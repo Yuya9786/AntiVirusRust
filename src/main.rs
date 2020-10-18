@@ -2,6 +2,7 @@ use yara::*;
 use std::env;
 use walkdir::WalkDir;
 use getopts::Options;
+use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -67,7 +68,7 @@ fn dir_scan(rules: &str, dir: &str) {
     compiler.add_rules_file(rules).unwrap();
     let rules = compiler.compile_rules().unwrap();
 
-
+    let time_start = Instant::now();
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         // let entry = entry.unwrap();
         let path = entry.path();
@@ -81,6 +82,8 @@ fn dir_scan(rules: &str, dir: &str) {
             }
         }
     }
+    let end = time_start.elapsed();
+    println!("{}.{:03}s passed.", end.as_secs(), end.subsec_nanos() / 1_000_000);
 }
 
 fn print_usage(program: &str, opts: Options) {
