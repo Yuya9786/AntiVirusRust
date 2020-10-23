@@ -1,16 +1,38 @@
-use yara::*;
-use std::env;
 use walkdir::WalkDir;
 use getopts::Options;
-use std::time::Instant;
+use std::{
+    env,
+    time::Instant,
+    path::*,
+};
+use actix::prelude::*;
+use actix::sync::SyncArbiter;
+use futures::future::join_all;
 
-fn main() {
+mod scanner;
+use scanner::{Scanner, Scan};
+
+struct Server {
+    // SyncArbiterに渡す構造体．AddrはSendとSyncが実装されているからスレッドに渡せる
+    scanner: Addr<Scanner>,
+}
+
+impl Server {
+    pub fn new(rules: PathBuf) -> Self {
+        let scanner = SyncArbiter::start(4, move || Scanner::new(&rules));
+        Self {
+            scanner
+        }
+    }
+}
+
+#[actix_rt::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
 
     let mut opts = Options::new();
-    opts.optopt("d", "dir", "scan under the directory", "DIR");
-    opts.optopt("f", "file", "scan the file", "NAME");
+    opts.optopt("t", "target", "scan the file or directory", "TARGET");
     opts.optopt("r", "rule", "set the rules", "RULE");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
@@ -18,75 +40,57 @@ fn main() {
         Err(f) => { panic!(f.to_string()) }
     };
     if matches.opt_present("h") {
-        print_usage(&program, opts);
+        print_usage(&program, opts).await;
         return;
     }
-    let rules = matches.opt_str("r");
-    let file = matches.opt_str("f");
-    let dir = matches.opt_str("d");
+    let rules = matches.opt_str("r").expect("ERROR: rules not found.");
+    let target = matches.opt_str("t").expect("ERROR: target not found.");
 
-    if matches.opt_present("h") {
-        print_usage(&program, opts);
-        return;
-    }
+    let rules = PathBuf::from(&rules);
+    let server = Server::new(rules);
 
-    prescan(rules, file, dir);
-    
-}
+    let scan_data = dir_scan(server, &target).await;
 
-fn prescan(rules: Option<String>, file:  Option<String>, dir: Option<String>) {
-    if rules.is_none() {
-        return;
-    }
-    let rules = rules.unwrap();
-
-    if file.is_some() {
-        file_scan(&rules, &(file.unwrap()));
-        return;
-    }
-
-    if dir.is_some() {
-        dir_scan(&rules, &(dir.unwrap()));
-        return;
+    println!("");
+    println!("----------- SCAN SUMMARY -----------");
+    println!("Time: {}.{:03} sec", scan_data.time_secs, scan_data.time_subsec_nanos);
+    println!("May be infected:");
+    for file in scan_data.infected {
+        println!("{}", file.display());
     }
 }
 
-fn file_scan(rules: &str, file: &str) {
-    let mut compiler = Compiler::new().unwrap();
-    compiler.add_rules_file(rules).unwrap();
-    let rules = compiler.compile_rules().unwrap();
-
-    let results = rules.scan_file(file, 5).unwrap();
-    if results.len() != 0 {
-        println!("{} may be a UPX file", file)
-        // println!("{:?}", results);
-    }
-}
-
-fn dir_scan(rules: &str, dir: &str) {
-    let mut compiler = Compiler::new().unwrap();
-    compiler.add_rules_file(rules).unwrap();
-    let rules = compiler.compile_rules().unwrap();
-
+async fn dir_scan(server: Server, dir: &str) -> ScanData {
     let time_start = Instant::now();
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        // let entry = entry.unwrap();
-        let path = entry.path();
-        // println!("{}", path.display());
-        let file_type = entry.file_type();
-        if file_type.is_file() {
-            let results = rules.scan_file(path, 5).unwrap();
-            if results.len() != 0 {
-                println!("{} may be a UPX file", path.display())
-                // println!("{:?}", results);
-            }
+    let mut results = vec![];
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+        let file = entry.path().into();
+        let timeout: u16 = 60;
+        results.push(server.scanner.send(Scan { file, timeout }));
+    }
+
+    let mut infected = vec![];
+    for scan_result in join_all(results).await {
+        let scan_result = scan_result.unwrap();
+        if scan_result.result.unwrap().len() > 0 {
+            infected.push(scan_result.file);
         }
     }
     let end = time_start.elapsed();
-    println!("{}.{:03}s passed.", end.as_secs(), end.subsec_nanos() / 1_000_000);
+    ScanData {
+        time_secs: end.as_secs(),
+        time_subsec_nanos: end.subsec_nanos() / 1_000_000,
+        infected: infected,
+    }
 }
 
-fn print_usage(program: &str, opts: Options) {
+pub struct ScanData {
+    pub time_secs: u64,
+    pub time_subsec_nanos: u32,
+    pub infected: Vec<PathBuf>,
+}
+
+async fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} FILE [options]", program);
     print!("{}", opts.usage(&brief));
 }
